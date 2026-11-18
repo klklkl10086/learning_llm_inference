@@ -1,16 +1,17 @@
-# 推理引擎学习
+# LLM 推理优化学习项目
 
-项目按“模型 → 缓存 → 多请求 → 分页缓存 → 推理引擎 → 多 GPU 通信”逐步推进。每阶段的具体目标在对应目录的 README；[学习计划与当前进度](docs/LEARNING_PLAN.md)记录文件地图、下一步和验收标准，[实验记录](docs/EXPERIMENT_LOG.md)用于保存可复现的对比结果。
+目标是从一个可运行的 Decoder 出发，逐步做出能处理多请求、可测量性能的小型推理引擎，再用实验理解 vLLM 的缓存、调度和执行优化。先完成 `01`～`05` 的单卡主线；量化与 CUDA 围绕测到的瓶颈开展，NCCL 放在多卡专题。
 
-| 阶段 | 内容 | 当前状态 |
+| 阶段 | 主要任务 | 当前进度 |
 | --- | --- | --- |
-| [01_transformer](01_transformer/README.md) | 小型 Decoder、训练与生成 | 已有实现、测试和小语料训练产物 |
-| [02_kv_cache](02_kv_cache/README.md) | 动态/预分配 KV cache、RoPE、不同长度请求 | 前三项已有实现；不同长度批量 decode 待实现 |
-| [03_scheduler](03_scheduler/README.md) | 请求状态与 continuous batching | 待实现 |
-| [04_paged_cache](04_paged_cache/README.md) | 物理块、block table、共享与回收 | 待实现 |
-| [05_inference_engine](05_inference_engine/README.md) | 组装执行循环并测量性能 | 待实现 |
-| [06_distributed_nccl](06_distributed_nccl/README.md) | 多 GPU 集合通信与张量并行 | 待实现 |
+| [01 Transformer](01_transformer/README.md) | 模型、训练、无缓存生成 | 已有实现、测试和小语料训练产物 |
+| [02 KV cache](02_kv_cache/README.md) | 动态/预分配缓存、RoPE、不同长度请求的批量 decode | 前三类实现已存在；`decode_batch.py` 仍是草稿，未验收 |
+| [03 调度](03_scheduler/README.md) | 请求状态、continuous batching、token 预算 | 仅有阶段说明 |
+| [04 分页缓存](04_paged_cache/README.md) | 物理块、block table、共享与回收 | 仅有阶段说明 |
+| [05 推理引擎](05_inference_engine/README.md) | 组装执行循环、性能测量、单卡优化 | 仅有阶段说明 |
 
-当前从 `02_kv_cache/request_len.py` 继续：先分别 prefill 不同长度的请求，再实现单步批量 decode，并用独立执行作为正确性基准。完成这一关后再进入调度和分页缓存。
+后续专题：[推理优化实验（SDPA、量化、CUDA）](docs/OPTIMIZATION.md)；[多 GPU 与 NCCL](06_distributed_nccl/README.md)。它们服务于推理引擎的实际问题，不要求现在并行推进。
 
-参考资料：[nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm)、[vLLM 架构](https://docs.vllm.ai/en/latest/design/arch_overview/)。阅读源码时固定一个提交版本；具体章节见各阶段 README。
+**当前任务**：在 [02 KV cache](02_kv_cache/README.md) 完成不同长度请求的批量 decode，并与逐请求执行比较 logits。完成后再进入调度。具体顺序、过关标准和文件地图见[学习计划](docs/LEARNING_PLAN.md)；实验结果填入[实验记录](docs/EXPERIMENT_LOG.md)。
+
+对照资料：[nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm)、[vLLM 架构](https://docs.vllm.ai/en/latest/design/arch_overview/)。阅读源码时固定一个提交版本，再查该版本对应的文档。

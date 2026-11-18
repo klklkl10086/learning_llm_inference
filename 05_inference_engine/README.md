@@ -7,6 +7,8 @@
 - 测量首 token 延迟、吞吐和显存，用 SDPA 等方式尝试优化。
 - 对照 nano-vLLM，再阅读 vLLM 的调度、KV 管理和 ModelRunner。
 
+先让多请求执行循环可用，再固定测试负载做基线；SDPA、量化和 CUDA 的实验顺序与指标见[优化专题](../docs/OPTIMIZATION.md)，数据填入[实验记录](../docs/EXPERIMENT_LOG.md)。
+
 完成标准：能追踪一条请求的完整生命周期，并解释一次优化的测量结果。
 
 参考资料（按顺序看）：

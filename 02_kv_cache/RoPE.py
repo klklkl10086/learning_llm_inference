@@ -95,11 +95,12 @@ class CasualSelfAttention(nn.Module):
         return x
 
     def forward(self, x, positions, past_key_value=None, use_cache=False):
-        B, T, C = x.shape  # T表示本轮输入的token数目
+        B, T, C = x.shape  # T表示本轮输入的token数目时间步
 
         Q = self.mutihead(self.Wq(x))  # [B,H, T,d_head]
         K_new = self.mutihead(self.Wk(x))  # 本次输入新生成的KV
         V_new = self.mutihead(self.Wv(x))
+        #RoPE
         Q = self.RoPE(Q, positions)
         K_new = self.RoPE(K_new, positions)
 
@@ -175,7 +176,7 @@ class LiteGPT(nn.Module):
         self.lm_head = nn.Linear(config["d_model"], config["vocab_size"])
         self.drop = nn.Dropout(config["dropout"])
 
-        self.apply(self._init_weights)
+        self.apply(self._init_weights) # 加载训练好的参数
         # 每层有两个残差分支，适当缩小输出投影的初始尺度。
         residual_std = 0.02 / math.sqrt(2 * config["n_layers"])
         for block in self.trans:
@@ -193,7 +194,7 @@ class LiteGPT(nn.Module):
                 nn.init.zeros_(module.bias)
 
     def forward(self, input_ids, targets=None, past_key_values=None, use_cache=False):
-        """targets 与 input_ids 同形状，由调用方提前错开一个 token。"""
+        """targets与input_ids同形状由调用方提前错开一个token位置。"""
         B, T = input_ids.shape
         if not 0 < T <= self.config["max_seq_len"]:
             raise ValueError("输入长度必须在 1 和 max_seq_len 之间")
