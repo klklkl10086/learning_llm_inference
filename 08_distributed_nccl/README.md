@@ -1,4 +1,4 @@
-# 06 多 GPU 通信与 NCCL
+# 08 多 GPU 通信与 NCCL
 
 这一阶段接在单 GPU 推理引擎之后。先通过 `torch.distributed` 学习 NCCL 集合通信，再对照 nano-vLLM 的张量并行实现。
 

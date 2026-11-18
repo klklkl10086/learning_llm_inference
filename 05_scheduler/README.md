@@ -1,4 +1,6 @@
-# 03 调度
+# 05 调度
+
+承接 [04 异长批量 decode](../04_batched_decode/README.md)，决定不同时间进入的请求何时 prefill、何时加入 decode batch。`scheduler.py` 已有草稿，后续按下列目标完善。
 
 要实现：
 

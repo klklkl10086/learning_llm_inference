@@ -1,6 +1,6 @@
 """
-单请求、无 padding、预先分配KV的缓存空间避免多次复制
-即假定每批次输出的长度都相同
+单请求或同长度 batch、无 padding，预分配 KV 空间避免每轮重新分配整个缓存。
+同一 batch 中的请求共享一个 past_len，因此不能直接处理不同历史长度的请求。
 
 实现RoPE:相邻两维度组成一对进行旋转
 """
@@ -176,7 +176,7 @@ class LiteGPT(nn.Module):
         self.lm_head = nn.Linear(config["d_model"], config["vocab_size"])
         self.drop = nn.Dropout(config["dropout"])
 
-        self.apply(self._init_weights) # 加载训练好的参数
+        self.apply(self._init_weights) # 随机初始化参数；这里不加载训练好的权重
         # 每层有两个残差分支，适当缩小输出投影的初始尺度。
         residual_std = 0.02 / math.sqrt(2 * config["n_layers"])
         for block in self.trans:

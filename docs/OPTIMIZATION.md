@@ -12,4 +12,4 @@
 
 CUDA 实验放在引擎能测量性能之后。先用 PyTorch profiler 或分阶段计时确认耗时位置，再实现一个算子；验收是数值对齐、重复测量以及对收益边界的解释。参考 [CUDA C++ 编程指南](https://docs.nvidia.com/cuda/cuda-programming-guide/)与 [PyTorch SDPA 教程](https://docs.pytorch.org/tutorials/intermediate/scaled_dot_product_attention_tutorial.html)。
 
-多卡专题见[06 NCCL](../06_distributed_nccl/README.md)：从两卡 collective 到简化张量并行推理，重点测通信时间及端到端收益。
+多卡专题见[08 NCCL](../08_distributed_nccl/README.md)：从两卡 collective 到简化张量并行推理，重点测通信时间及端到端收益。

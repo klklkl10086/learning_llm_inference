@@ -1,6 +1,6 @@
 """
-仅支持不同长度请求批量decode
-新增RequestState类管理请求
+每个请求单独 prefill，再用 RequestState 管理缓存并批量 decode 不同长度请求。
+decode_batch 每轮只处理每个请求的一个待计算 token。
 """
 
 import math

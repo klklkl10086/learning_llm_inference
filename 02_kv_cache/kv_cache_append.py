@@ -1,17 +1,16 @@
 """
-单请求、无 padding、预先分配KV的缓存空间避免多次复制
-即假定每批次输出的长度都相同
+单请求或同长度 batch、无 padding，预分配 KV 空间避免每轮重新分配整个缓存。
+同一 batch 中的请求共享一个 past_len，因此不能直接处理不同历史长度的请求。
 
 缓存结构:
 1. 单层:
-    past_key_value = (past_k, past_v)
+    past_key_value 是 LayerKVCache 对象，包含 .k、.v 和 .length
 
-2. 整个模型, 6 层分别保存
+2. 整个模型, 每层分别保存一个 LayerKVCache
     past_key_values = (
-        (layer0_k, layer0_v),
-        (layer1_k, layer1_v),
+        layer0_cache,
+        layer1_cache,
         # ...
-        (layer5_k, layer5_v),
     )
 """
 

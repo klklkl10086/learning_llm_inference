@@ -1,33 +1,23 @@
-# 02 KV cache
+# 02 基础 KV cache
 
-在上一阶段模型上实现：
+本阶段沿用 [01 Transformer](../01_transformer/README.md) 的可训练绝对位置 embedding，先实现单请求缓存，再比较动态拼接和预分配两种存储方式。
 
-- Prefill 保存每层 K/V，decode 每次只处理新 token。
-- 正确处理位置偏移和 attention mask。
-- 先用拼接缓存，再改成预分配缓存。
-- 加入 RoPE，比较缓存大小和生成耗时。
-
-完成标准：相同输入和权重下，缓存与完整重算的 logits 在合理误差内一致。
-
-## 文件地图与当前任务
-
-这些文件保留了逐步演进的版本，便于比较，不需要互相覆盖：
-
-| 文件 | 用途 |
+| 文件 | 作用 |
 | --- | --- |
-| `kv_cache.py` | 使用 `torch.cat` 扩展 KV 的第一版 |
-| `kv_cache_pro.py` | 预分配 KV 空间，用长度标记已写入区域 |
-| `RoPE.py` | 在预分配 KV 上为 Q/K 加入 RoPE |
-| `decode_batch.py` | 从 RoPE 版出发，练习不同长度请求的批量 decode；目前是未验收的草稿 |
-| `benchmark_kv_cache.py` | 对比前两版缓存的正确性、prefill/decode 耗时与占用；目前不测 RoPE 或多请求 |
+| [`kv_cache.py`](kv_cache.py) | 每轮用 `torch.cat` 扩展 K/V |
+| [`kv_cache_append.py`](kv_cache_append.py) | 预分配 K/V，用 `length` 标记有效前缀 |
+| [`benchmark_kv_cache.py`](benchmark_kv_cache.py) | 读取 01 阶段 checkpoint，验证输出并比较两种缓存 |
 
-下一步先确保 `decode_batch.py` 可导入，再让每个请求分别完成 prefill 并持有自己的缓存，把每个请求的一个待计算 token 组成 decode batch。为每个请求分别生成位置、写入并读取 KV，按有效长度屏蔽补齐部分。用两个长度分别为 3 和 7 的请求验证：合批 decode 与分别 decode 的 logits 一致，且缓存长度独立增长。
+prefill 将每层 K/V 写入缓存；decode 每轮只输入新增 token，并使用缓存长度确定绝对位置和因果 mask。`kv_cache.py` 的单层缓存是 `(K, V)`；预分配版用 `LayerKVCache.k/.v` 保存固定容量，`.length` 表示已写入长度。完成标准是在同一权重和输入下，缓存版与完整重算的 logits 一致，并能说明有效 KV 大小和已分配空间的区别。
 
-`benchmark_kv_cache.py` 使用 01 阶段的绝对位置编码 checkpoint，仅对比 `kv_cache.py` 与 `kv_cache_pro.py`。RoPE 版改变了位置编码，不能直接用这个 checkpoint 证明 RoPE 生成质量；RoPE 数值对比要使用同一组 RoPE 模型权重。
+在本目录、已安装 PyTorch 的环境中运行：
 
-阶段计划和验收顺序见[学习计划](../docs/LEARNING_PLAN.md)。
+```bash
+python benchmark_kv_cache.py --device cuda --batch-size 1 --prompt-len 64 --decode-steps 32 --warmup 2 --repeats 7
+```
 
-参考资料（按顺序看）：
+脚本先比较拼接与预分配版本的 logits，再报告 prefill/decode 耗时、KV 已分配/有效空间和峰值额外显存。GPU 计时在边界同步，结果取重复测量的中位数；decode 使用预设 token，不包含采样、排队或端到端首 token 延迟。`peak_extra` 从 prefill 前的模型常驻显存计起。实际命令和数据见[实验记录](../docs/EXPERIMENT_LOG.md)。
 
-- [Transformers KV cache 文档](https://huggingface.co/docs/transformers/kv_cache)：了解动态缓存、静态缓存和缓存的使用方式。
-- [RoFormer / RoPE 论文](https://arxiv.org/abs/2104.09864)：理解对 Q/K 施加旋转，以及位置差如何进入注意力计算。
+后续按 [03 RoPE](../03_rope/README.md) → [04 异长批量 decode](../04_batched_decode/README.md) 推进。RoPE 版改变了位置编码，不能直接使用本阶段的绝对位置编码 checkpoint 评价其生成质量。
+
+参考：[Transformers KV cache 文档](https://huggingface.co/docs/transformers/kv_cache)。

@@ -1,6 +1,6 @@
 """
-单请求、无 padding、用 torch.cat 追加缓存
-即假定每批次输出的长度都相同
+单请求或同长度 batch、无 padding，用 torch.cat 追加缓存。
+同一 batch 中的请求共享一个 past_len，因此不能直接处理不同历史长度的请求。
 
 缓存结构:
 1. 单层:

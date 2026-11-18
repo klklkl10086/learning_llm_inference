@@ -79,14 +79,20 @@ def measure_once(model, tokens, prompt_len, device):
 
     if hasattr(cache[0], "k"):
         tensors = [tensor for layer in cache for tensor in (layer.k, layer.v)]
+        valid_bytes = sum(
+            tensor[:, :, :layer.length].numel() * tensor.element_size()
+            for layer in cache for tensor in (layer.k, layer.v)
+        )
     else:
         tensors = [tensor for layer in cache for tensor in layer]
+        valid_bytes = sum(t.numel() * t.element_size() for t in tensors)
     cache_mib = sum(t.numel() * t.element_size() for t in tensors) / 1024**2
+    valid_cache_mib = valid_bytes / 1024**2
     peak_mib = (
         (torch.cuda.max_memory_allocated(device) - baseline) / 1024**2
         if device.type == "cuda" else None
     )
-    return prefill_ms, decode_ms, cache_mib, peak_mib
+    return prefill_ms, decode_ms, cache_mib, valid_cache_mib, peak_mib
 
 
 def main():
@@ -117,7 +123,7 @@ def main():
         checkpoint["config"]["vocab_size"],
         (args.batch_size, args.prompt_len + args.decode_steps),
     )
-    paths = (("torch.cat", HERE / "kv_cache.py"), ("preallocated", HERE / "kv_cache_pro.py"))
+    paths = (("torch.cat", HERE / "kv_cache.py"), ("preallocated", HERE / "kv_cache_append.py"))
 
     tokens = tokens.to(device)
     dynamic = load_model(paths[0][1], checkpoint, device)
@@ -137,17 +143,18 @@ def main():
             measure_once(model, tokens, args.prompt_len, device)
             for _ in range(args.repeats)
         ]
-        prefill, decode, cache = (
-            statistics.median(sample[i] for sample in samples) for i in range(3)
+        prefill, decode, cache, valid_cache = (
+            statistics.median(sample[i] for sample in samples) for i in range(4)
         )
         peak = (
-            statistics.median(sample[3] for sample in samples)
+            statistics.median(sample[4] for sample in samples)
             if device.type == "cuda" else None
         )
         print(
             f"{name}: prefill={prefill:.3f} ms, "
-            f"decode={decode:.3f} ms ({decode / args.decode_steps:.3f} ms/token), "
-            f"cache={cache:.3f} MiB, "
+            f"decode={decode:.3f} ms ({decode / args.decode_steps:.3f} ms/step, "
+            f"{args.batch_size * args.decode_steps / (decode / 1000):.1f} token/s), "
+            f"kv_allocated={cache:.3f} MiB, kv_valid={valid_cache:.3f} MiB, "
             f"peak_extra={f'{peak:.3f} MiB' if peak is not None else 'N/A'}",
             flush=True,
         )
