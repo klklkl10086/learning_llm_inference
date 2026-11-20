@@ -1,6 +1,6 @@
 # 08 多 GPU 通信与 NCCL
 
-这一阶段接在单 GPU 推理引擎之后。先通过 `torch.distributed` 学习 NCCL 集合通信，再对照 nano-vLLM 的张量并行实现。
+这一阶段接在单 GPU 推理引擎之后，后续并行层与执行器继续接入 [llm_inference 主线](../llm_inference/README.md)。先通过 `torch.distributed` 学习 NCCL 集合通信，再对照 nano-vLLM 的张量并行实现。
 
 建议按以下顺序完成：
 

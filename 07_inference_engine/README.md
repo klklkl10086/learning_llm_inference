@@ -1,18 +1,35 @@
-# 07 推理引擎
+# 07 模型执行器与推理引擎
 
-要实现：
+这个专题提前与 [05 调度](../05_scheduler/README.md) 一起完成。先用连续 KV cache 跑通最小系统，再加入 [06 分页缓存](../06_paged_cache/README.md)。后续实现集中写入 [llm_inference](../llm_inference/README.md)。
 
-- 连接请求、调度器、缓存管理器和模型执行器。
-- 跑通“调度 → 执行 → 更新状态 → 回收”的循环。
-- 测量首 token 延迟、吞吐和显存，用 SDPA 等方式尝试优化。
-- 对照 nano-vLLM，再阅读 vLLM 的调度、KV 管理和 ModelRunner。
+## 第一步 ModelRunner
 
-先让多请求执行循环可用，再固定测试负载做基线；SDPA、量化和 CUDA 的实验顺序与指标见[优化专题](../docs/OPTIMIZATION.md)，数据填入[实验记录](../docs/EXPERIMENT_LOG.md)。
+未来文件为 `llm_inference/model_runner.py`，当前尚未创建。先包装已有 `model.py` 的两个入口：
 
-完成标准：能追踪一条请求的完整生命周期，并解释一次优化的测量结果。
+- prefill：按计划顺序收集 prompts，执行 prefill_batch，采样首个 token，返回请求对应的模型状态和结果。
+- decode：按计划顺序收集状态，执行 decode_batch，采样下一个 token，返回结果。
+- 请求结束时释放执行器持有的状态引用；将来再调用独立缓存管理器回收物理块。
 
-参考资料（按顺序看）：
+先使用 argmax。明确谁追加生成 token，避免执行器与调度器各追加一次。
 
-- [nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm)：先追踪请求如何经过调度器、块管理器和模型执行器。
-- [vLLM 架构说明](https://docs.vllm.ai/en/latest/design/arch_overview/)：对照 Engine Core、Worker 和 ModelRunner 的职责，追踪一次请求。
-- [PyTorch SDPA 教程](https://docs.pytorch.org/tutorials/intermediate/scaled_dot_product_attention_tutorial.html)：将手写 Attention 替换为 SDPA，比较正确性、耗时和显存。
+## 第二步 Engine
+
+未来文件为 `llm_inference/engine.py`，当前尚未创建。对外接收请求，使用一轮 step 串联：
+
+```text
+Scheduler.schedule
+  → ModelRunner.execute
+  → Scheduler 更新请求与队列
+  → 回收已结束请求的模型状态
+  → 返回本轮生成结果
+```
+
+先跑一个请求，再跑多个异长请求，最后在执行过程中加入新请求。每轮记录选中了谁、本轮输入 token 数、已缓存长度、生成数量和结束原因。
+
+当前调度器的回调尚未完成。执行失败时如何清理正在执行的计划，以及模型已部分写入 KV 时如何处理，也应在接通执行循环时明确。
+
+## 第三步 测量与优化
+
+先用逐请求执行核对多请求的 token 和 logits，再固定负载，测首 token 延迟、后续 token 延迟、吞吐和显存。根据测量结果选择[优化专题](../docs/OPTIMIZATION.md)，将实际数据写入[实验记录](../docs/EXPERIMENT_LOG.md)。
+
+完整组件边界见[系统设计](../docs/ARCHITECTURE.md)。参考：[nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm)、[vLLM 架构说明](https://docs.vllm.ai/en/latest/design/arch_overview/)、[PyTorch SDPA 教程](https://docs.pytorch.org/tutorials/intermediate/sdpa_tutorial.html)。
