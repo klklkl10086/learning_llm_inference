@@ -1,64 +1,70 @@
-# 从已有代码接成推理系统
+# 推理系统、量化与 GPU 算子的学习路线
 
-目标是沿着同一套请求、模型执行和缓存约定持续增加功能，最终形成可以解释每轮行为、验证正确性并测量性能的推理系统。目录编号是学习专题，实际顺序按功能依赖调整。
+以可运行里程碑组织学习。目录编号用于检索，不等于先修顺序；08 多 GPU 不挡住 09 量化或 10 CUDA 基础。当前状态与阻塞问题见[检查记录](REVIEW_2026-11-20.md)。
 
-## 当前起点
+## 主线：把已有代码接成系统
 
-- [主线模型](../llm_inference/model.py)：由 batch_prefill_decode_optimized.py 原样迁入，已有批量 prefill/decode。
-- [主线调度器](../llm_inference/scheduler.py)：由 05 原样迁入，结果处理未完成。
-- [回调草稿](../05_scheduler/scheduler_callbacks_draft.py)：原 tmp.py，尚未接入 Scheduler。
-- [04 对照实现与测试](../04_batched_decode/README.md)：保留完整前向、逐请求执行、已有测试和 benchmark。
-- 01–03 保留模型、缓存和位置编码的学习过程；现有训练产物位置保持不变。
-
-目录入口见[项目首页](../README.md)，职责与数据流见[系统设计](ARCHITECTURE.md)。
-
-## 按可运行里程碑推进
-
-| 顺序 | 要写的内容 | 完成标准 |
+| 顺序 | 要做的内容 | 完成标准 |
 | --- | --- | --- |
-| 1 模型契约 | 读懂主线 prefill/decode 的输入、输出和 KV 变化 | 能解释 pending_token 与 cached_len，使用同权重与 04 对照 |
-| 2 ModelRunner | 包装模型执行、状态对应和 argmax 采样 | 独立运行完整 prefill 和多轮 decode，请求与结果顺序正确 |
-| 3 Scheduler 与最小 Engine | 补完调度回调、结束处理、提交请求和 step | 先跑一个请求，再跑多个异长请求，结束后释放模型状态 |
-| 4 连续组批 | 执行过程中接纳新请求，移除完成或取消的请求 | 日志能解释每轮选了谁，已有请求不会被持续插入的短请求无限推迟 |
-| 5 分块 prefill | 计划表达每请求计算进度，模型支持历史 KV 上续算 | 长 prompt 可跨轮推进，结果与整段 prefill 对照一致 |
-| 6 分页缓存 | 物理块、block table、分配和回收，再考虑共享 | 与连续缓存输出接近，块边界和回收正确 |
-| 7 性能实验 | 固定负载、记录基线，逐个改动计算与存储路径 | 数值对照通过，能解释耗时、吞吐和显存变化 |
-| 8 多 GPU | collective、小型并行层、接入现有执行器 | 与单卡输出接近，能区分通信开销和计算收益 |
+| 1 模型契约 | 读主线 RequestState、prefill_batch、decode_batch | 能解释采样 token 与已计算 token 的区别；同权重对照 04 |
+| 2 ModelRunner | 完成已有骨架的执行、argmax、状态映射和 release | 单请求完整生成、多个异长请求换序执行正常 |
+| 3 Scheduler + Engine | 修正 update 问题，再实现提交请求和 step | schedule → execute → update → release 完整闭环 |
+| 4 动态请求 | 运行中接纳新请求、结束旧请求 | 日志能解释每轮选择，长期活跃请求能持续推进 |
+| 5 分块 prefill | 计划与模型支持历史 KV 上的分段计算 | 长 prompt 跨轮执行，结果与完整 prefill 对照 |
+| 6 分页缓存 | 物理块、block table、分配与回收，最后再加共享 | 与连续缓存对照；覆盖块边界、资源不足和回收 |
+| 7 按瓶颈集成优化 | 接入已验证的量化/算子/attention 路径 | 正确性、延迟、吞吐、显存有可复现对照 |
+| 8 多 GPU | collective → 并行 Linear → 并行模型 | 对照单卡结果，分清通信与计算收益 |
 
-最小引擎与调度一起完成，提前于分页缓存。首个引擎不依赖 block table，也不要求先完成分块 prefill。
+最小引擎先于分页缓存。初版只做完整 prefill 或单 token decode，避免同时引入调度、分页和算子三类变量。
 
-## 下一次手写的具体顺序
+## 支线一：量化，可以现在开始
 
-1. 先读主线 model.py 中的 RequestState、prefill_batch 和 decode_batch，记录调用前后 token 数与缓存长度。
-2. 新增 model_runner.py，先包装当前模型接口，不改模型计算，使用 argmax。
-3. 参考回调草稿，继续完成 scheduler.py；确认每个 token 只追加一次。
-4. 新增 engine.py，接通 schedule → execute → update → release。
-5. 写一个多请求例子，逐轮输出请求 ID、阶段、本轮输入 token 数、缓存长度、生成数量和结束原因。
-6. 对照逐请求执行检查 token 和 logits，再考虑增加新的调度策略。
+按 [09 量化](../09_quantization/README.md) 完成：
 
-ModelRunner、Engine 与上述例子当前均未创建；这里保留给后续自己实现。
+1. 单张量量化/还原：scale、zero point、clipping、对称/非对称、不同粒度。
+2. 单 Linear 的 W8A16 原型：量化权重，还原后浮点计算，理解误差与真实存储。
+3. 分组量化与 INT4 打包，区分 4 位数值范围和实际 4 位存储。
+4. 结合已有 KV cache 做 INT8 存储实验，比较长序列的误差、显存与还原开销。
+5. 需要时扩展 W8A8、校准与 GPTQ/AWQ/SmoothQuant，再选择一个后端对照。
 
-## 验证入口与口径
+基础实验不依赖 Engine。模型质量评估需要训练权重和固定评估集；随机小模型只适合验证数值路径。
 
-在项目根目录、已安装 PyTorch 的环境中运行：
+## 支线二：CUDA / Triton，可以现在开始
+
+按 [10 算子](../10_cuda_kernels/README.md) 推进：
+
+1. CUDA C++ vector add：grid/block/thread、边界判断和访存。
+2. reduction：warp、shared memory、同步与归约。
+3. softmax、LayerNorm：数值稳定性、行归约和访存；对应当前模型的实际算子。
+4. RoPE：位置索引、layout、融合访存；可与现有 RoPE 对照。
+5. 小型 matmul 学习 tile，然后依据 profiler 选择模型瓶颈，最后再研究 attention 融合。
+
+CUDA C++ 是理解线程与存储的主线；可为同一算子增加 Triton 对照，初期不必每个算子都维护两套实现。RMSNorm 可以独立学，但当前模型用 LayerNorm，不能直接替换后要求输出一致。
+
+## 下一次动手的具体安排
+
+建议先完成一个可运行的主线步骤，再做一个支线小实验：
+
+- 主线：继续 model_runner.py，明确 plan → 请求状态 → logits → 采样结果的映射；自查调度 update，再接 Engine。
+- 量化第一个实验：随机张量做对称 INT8 量化/还原，覆盖全零和离群值，输出误差与实际存储字节。
+- CUDA 第一个实验：vector add，对比 PyTorch，覆盖长度不能被 block size 整除的情况。
+
+每次完成后写简短实验记录与 Git 提交。不要为了新阶段复制完整模型；不要先堆积空代码文件。
+
+## 验证与记录
+
+已有测试命令见[项目首页](../README.md)。新增实现后围绕实际行为验证；04 测试不自动覆盖主线优化模型、Scheduler 或未来 Engine。
+
+数值对照固定架构、权重、输入、eval 模式和 dtype，先核对 logits。量化实验再增加局部重构误差与质量指标。性能比较固定负载，记录环境、预热、重复次数和计时边界；区分 kernel、模型与包含排队的端到端耗时。
+
+已有 benchmark 仍在对应目录运行：
 
 ```bash
-python -B -m unittest discover -s 01_transformer -p 'test_transformer.py' -v
-python -B -m unittest discover -s 04_batched_decode -p 'test_decode_batch.py' -v
-```
-
-在对应实验目录运行已有 benchmark：
-
-```bash
-# 02_kv_cache/；默认读取 01_transformer/runs/demo/model.pt
+# 在 02_kv_cache/，读取 01 的 checkpoint
 python -B benchmark_kv_cache.py --device cuda --batch-size 1 --prompt-len 64 --decode-steps 32 --warmup 2 --repeats 7
 
-# 04_batched_decode/；同一个随机 RoPE 模型的逐请求与合批比较
+# 在 04_batched_decode/，使用随机初始化的同一个 RoPE 模型
 python -B benchmark_decode_batch.py --device cuda --prompt-lens 32,64,96,128 --decode-steps 32 --warmup 2 --repeats 7
 ```
 
-04 的测试和 benchmark 当前针对普通版，通过旧名 decode_batch.py 的符号链接导入。它们不自动覆盖主线优化模型、调度器或未来引擎。新增系统功能时，围绕实际行为增加验证，保留普通版作对照。
-
-数值比较固定权重、输入 token、eval 模式和精度，先核对 logits。性能比较记录设备、模型、提示长度、生成步数、并发数、预热、重复次数与计时边界；区分仅模型执行与包含排队、采样、调度的端到端耗时。GPU 计时在边界同步。
-
-01–02 的绝对位置编码与 03 之后的 RoPE 是不同模型结构。历史 benchmark 的输入和测量口径也各不相同，不能跨实验直接计算加速比。已执行的数据保留在[实验记录](EXPERIMENT_LOG.md)，后续选题见[优化专题](OPTIMIZATION.md)。
+01–02 的绝对位置编码与 03 之后的 RoPE 不同，不能直接共用训练 checkpoint 评价质量。实验结果见[实验记录](EXPERIMENT_LOG.md)，选题与测量见[优化专题](OPTIMIZATION.md)。

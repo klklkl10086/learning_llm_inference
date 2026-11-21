@@ -1,15 +1,29 @@
-# 推理优化专题
+# 推理优化实验怎么选
 
-在 [llm_inference 主线](../llm_inference/README.md) 跑通最小引擎并建立性能基线后，围绕同一组请求负载选择实验；每次只改一个变量，把结果记入[实验记录](EXPERIMENT_LOG.md)。先看正确性，再比较首 token 延迟、后续 token 延迟、吞吐和峰值显存。小模型可用来验证实现，但其性能结论不能直接推广到较大模型。
+分成独立基础实验与系统集成实验。单张量量化、单算子 CUDA 现在即可学习；集成时使用 [llm_inference](../llm_inference/README.md) 的相同模型、请求和基线，每次只改变一个变量。
 
-| 主题 | 最小实验 | 要回答的问题 |
+| 专题 | 起步实验 | 系统接入前要回答的问题 |
 | --- | --- | --- |
-| SDPA | 保持模型、输入与精度一致，将手写 attention 与 PyTorch SDPA 比较 | 数值是否接近？prefill/decode 延迟和显存如何变化？不同形状下结果是否一致？ |
-| KV cache 量化 | 在已有缓存上做一个 8 位存储、读取时还原的原型，再对照未量化缓存 | 存储节省多少？logits 误差多少？还原开销是否抵消了收益？ |
-| CUDA 单算子 | 通过测量选一个算子，例如 LayerNorm，写最小 CUDA 实现并与 PyTorch 比较 | 哪些输入形状受益？优化的是计算、访存还是调用开销？ |
+| Attention / SDPA | 相同输入、dtype 和 mask 对照手写 attention | prefill/decode 的 mask 与布局是否正确？实际耗时和显存是否改善？ |
+| [量化](../09_quantization/README.md) | 张量 INT8 → Linear 权重 → 分组/INT4 → KV cache | 误差如何累积？元数据占多少？反量化后浮点计算是否仍有收益？ |
+| [CUDA / Triton](../10_cuda_kernels/README.md) | vector add → 归约 → softmax/LayerNorm → RoPE | 是否正确？哪些形状受益？是否减少访存或 launch？ |
+| [多 GPU](../08_distributed_nccl/README.md) | 两卡 collective → 并行 Linear | 分片与单卡结果一致吗？通信是否抵消计算收益？ |
 
-量化实验先从已实现的 KV cache 入手；权重量化和激活量化属于后续扩展。8 位原型的目标是理解尺度、误差和内存布局，不能仅凭存储位数推断端到端加速。实际部署可对照 [vLLM 量化功能](https://docs.vllm.ai/en/latest/features/quantization/)和所用 GPU、后端的支持情况。
+## 测量顺序
 
-CUDA 实验放在引擎能测量性能之后。先用 PyTorch profiler 或分阶段计时确认耗时位置，再实现一个算子；验收是数值对齐、重复测量以及对收益边界的解释。参考 [CUDA C++ 编程指南](https://docs.nvidia.com/cuda/cuda-programming-guide/)与 [PyTorch SDPA 教程](https://docs.pytorch.org/tutorials/intermediate/scaled_dot_product_attention_tutorial.html)。
+1. 固定架构、权重、输入与推理设置，先确认正确性；量化时明确允许的误差及质量下降范围。
+2. 用分阶段计时或 [PyTorch profiler](https://docs.pytorch.org/docs/stable/profiler.html) 定位实际瓶颈，再选择集成点。
+3. 测单算子、模型阶段、引擎端到端三个层级；收益分别记录。
+4. GPU 采用 CUDA events 或计时边界同步；JIT/编译、首次初始化和正常执行分别计时。预热后重复测量并记录中位数及波动。
+5. 固定形状之外，再扫 batch、prompt/decode 长度，说明何时受益、何时变慢。
 
-多卡专题见[08 NCCL](../08_distributed_nccl/README.md)：从两卡 collective 到简化张量并行推理，重点测通信时间及端到端收益。
+## 记录口径
+
+- 正确性：局部输出和 logits 的最大绝对/相对误差；量化增加 MSE、重构误差，必要时在固定验证集测困惑度或任务指标。
+- 存储：权重/KV 实际张量与 scale、zero point、padding 等元数据字节；另记进程/分配器峰值显存。
+- 性能：prefill 时间、decode 时间、token/s；Engine 可运行后再测包含排队与采样的 TTFT/每 token 延迟。
+- 条件：GPU、软件版本、代码版本、shape、dtype、输入/生成策略、预热与重复次数、计时范围。
+
+INT4 保存在 int8 容器里且没有打包时，不会自然得到 4 位存储。先反量化成浮点再 matmul 的原型用于学习误差，是否节省峰值显存或加速都需要实测。单算子加速不能直接推断系统加速。小模型性能结论也不能直接推广到大模型。
+
+具体模板见[实验记录](EXPERIMENT_LOG.md)。官方资料与论文按专题收在 [09](../09_quantization/README.md) 和 [10](../10_cuda_kernels/README.md)。

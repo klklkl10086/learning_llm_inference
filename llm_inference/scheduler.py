@@ -2,15 +2,32 @@
 来源 ./05_scheduler/schedule.py
 整批 prefill 或整批 decode尚未实现分块prefill
 调度策略:
-1. 上一批是 prefill并且有可执行的 decode
+1. 上一批是prefill并且有可执行的 decode
        执行 decode
 2. 否则有空闲槽位且能接纳 prefill
        执行 prefill
 3. 否则有可执行的decode
-       执行 decode
+       执行decode
 4. 否则
        没有任务
 同一个批次中prefill 和 decode 不同时出现。
+一个请求 A 的流转是：
+add_request(A)
+    waiting = [A]
+    active  = []
+schedule() 选中 A 做 prefill
+    waiting = []
+    active  = [A]      ← 已经占用并发名额
+    inflight = PREFILL(A)
+                       ← 此时还没执行模型
+runner.execute(...)
+    为 A 创建并写入 KVCache
+scheduler.update(...)
+    记录计算进度、追加生成 token
+    active = [A]       ← 如果没结束，继续保留
+    inflight = None
+下一次 schedule()
+    A 才成为可以执行 decode 的请求
 """
 
 from dataclasses import dataclass
@@ -51,11 +68,7 @@ class BatchKind(Enum):
 class ScheduledRequest:
     request_id: str
     start_pos: int
-    input_token_ids: tuple[int, ...]
-
-    @property
-    def num_tokens(self) -> int:
-        return len(self.input_token_ids)
+    num_tokens: int
 
 
 @dataclass(frozen=True)
@@ -75,10 +88,11 @@ class Scheduler:
         self.max_active_requests = max_active_requests
         self.max_batch_input_tokens = max_batch_input_tokens
 
+        #已有的request列表
         self._requests: dict[str, Request] = {}
 
-        self._waiting: deque[str] = deque()
-        self._active: deque[str] = deque()  # 表示请求已经占用并发槽位
+        self._waiting: deque[str] = deque() # 尚未参与调度、尚未占用并发名额的请求
+        self._active: deque[str] = deque()  # 已经参与调度、占用并发名额、尚未结束的请求
 
         self._inflight_plan: BatchPlan | None = None  # 本轮模型执行批次
 
@@ -117,17 +131,15 @@ class Scheduler:
 
     def _select_decode_requests(self) -> tuple[str, ...]:
         """
-        对于已经完成 prefill、尚未结束的请求:
+        对于已经完成 prefill、尚未结束的请求满足:
         len(req.token_ids) == req.num_computed_tokens + 1
         """
         selected: list[str] = []
-
         for request_id in self._active:  # 检查已经完成 prefill、尚未结束的请求
-
             if len(selected) >= self.max_batch_input_tokens:
                 # 每个decode请求只有一个token需要计算
                 break
-
+            
             req = self._requests[request_id]
 
             if req.status is not RequestStatus.ACTIVE:
@@ -161,18 +173,17 @@ class Scheduler:
 
             if kind is BatchKind.PREFILL:
                 start_pos = 0
-                input_token_ids = tuple(req.token_ids[: req.prompt_len])
+                num_tokens = req.prompt_len  # prefill没有实现分块prefill
             elif kind is BatchKind.DECODE:
                 start_pos = req.num_computed_tokens
-
-                input_token_ids = (req.token_ids[start_pos],)
+                num_tokens = 1  # decode默认为1
             else:
                 raise RuntimeError("未知批次类型")
             items.append(
                 ScheduledRequest(
                     request_id=request_id,
                     start_pos=start_pos,
-                    input_token_ids=input_token_ids,
+                    num_tokens=num_tokens,
                 )
             )
 
@@ -225,7 +236,7 @@ class Scheduler:
 
     def add_request(
         self,
-        request_id: int,
+        request_id: str,
         prompt_token_ids: list[int],
         max_new_tokens: int,
     ) -> Request:
@@ -282,7 +293,7 @@ class Scheduler:
             req = self._requests[item.request_id]
             req.num_computed_tokens += item.num_tokens
 
-            next_token = sample_tokens[item.request_id]
+            next_token = sampled_tokens[item.request_id]
             req.token_ids.append(next_token)
 
             if req.num_generated_tokens >= req.max_new_tokens:

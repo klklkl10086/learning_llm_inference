@@ -10,35 +10,42 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 
-class RequestState:
-    def __init__(self, token_ids, past_key_values):
-        if not token_ids or not past_key_values:
-            raise ValueError("需要非空prompt和prefill后的KV cache")
+class KVCache:
+    """一个请求的所有层 KV,length只在完整模型前向结束后推进。"""
 
-        self.token_ids = list(token_ids)
-        self.past_key_values = tuple(past_key_values)
+    def __init__(self, num_layers: int, capacity: int):
+        self.keys: list[torch.Tensor | None] = [None] * num_layers
+        self.values: list[torch.Tensor | None] = [None] * num_layers
+        self.capacity = capacity
+        self.length = 0 #缓存当前已有多少个token的有效 KV
 
-        # 创建状态时应已全部prefill
-        if self.cached_len != len(self.token_ids):
-            raise ValueError("初始化时token_ids应恰好对应已缓存的prompt")
+    def write(self, layer_idx, start_pos, k_new, v_new):
+        """写入指定层的新KV不改变整个请求的缓存长度。"""
+        end_pos = start_pos + k_new.size(-2)
+        if end_pos > self.capacity:
+            raise ValueError("KV cache 容量不足")
 
-    @property  # 把方法伪装成属性，让你能像访问属性一样调用它
-    def cached_len(self):
-        lengths = [cache.length for cache in self.past_key_values]
-        if len(set(lengths)) != 1:
-            raise ValueError("同一请求的各层缓存长度不一致")
-        return lengths[0]
+        if self.keys[layer_idx] is None:
+            # 首次写入时按实际 K/V 的设备、dtype 分配，兼容 autocast。
+            B, H, _, D = k_new.shape
+            self.keys[layer_idx] = k_new.new_empty(B, H, self.capacity, D) #分配空间
+            self.values[layer_idx] = v_new.new_empty(B, H, self.capacity, D)
 
-    @property
-    def pending_token(self):  # 最新要进入decode的token
-        if len(self.token_ids) != self.cached_len + 1:
-            raise ValueError("每个请求必须恰有一个尚未计算的token")
-        return self.token_ids[-1]
+        self.keys[layer_idx][:, :, start_pos:end_pos, :].copy_(k_new)
+        self.values[layer_idx][:, :, start_pos:end_pos, :].copy_(v_new)
 
-    def append_token(self, token_id):  # 最新decode完成的token
-        if len(self.token_ids) != self.cached_len:
-            raise ValueError("先计算上一个待处理 token，再追加新 token")
-        self.token_ids.append(int(token_id))
+    def get_layer(self, layer_idx, end_pos):
+        """读取指定层的KVcache缓存,包含刚生成的"""
+        return (
+            self.keys[layer_idx][:, :, :end_pos, :],
+            self.values[layer_idx][:, :, :end_pos, :],
+        )
+
+    def advance(self, num_tokens: int):
+        """更新length"""
+        if self.length + num_tokens > self.capacity:
+            raise ValueError("KV cache 容量不足")
+        self.length += num_tokens
 
 
 class RotaryEmbedding(nn.Module):
@@ -93,26 +100,6 @@ class RotaryEmbedding(nn.Module):
         )  # flatten(start_dim=-2) 表示把最后两维（-2 和 -1）合并成一维：
 
 
-class LayerKVCache:
-    def __init__(self, k_new, v_new, capacity):
-        B, H, _, D = k_new.shape
-        self.k = k_new.new_empty(B, H, capacity, D)
-        self.v = v_new.new_empty(B, H, capacity, D)
-        self.length = 0
-
-    def append(self, k_new, v_new):
-        start = self.length
-        end = start + k_new.size(-2)
-        if end > self.k.size(-2):
-            raise ValueError("KV CACHE is not enough")
-
-        self.k[:, :, start:end, :].copy_(k_new)
-        self.v[:, :, start:end, :].copy_(v_new)
-        self.length = end
-
-        return self.k[:, :, :end, :], self.v[:, :, :end, :]
-
-
 class CasualSelfAttention(nn.Module):
     """
     Q/K/V 投影、拆分多头、因果掩码、注意力计算、合并多头、输出投影
@@ -144,8 +131,8 @@ class CasualSelfAttention(nn.Module):
 
         return x
 
-    def prefill_batch(self, x, positions, lengths, capacities):
-        """计算补齐后的整批注意力 只缓存每个请求的有效prompt不包含padding部分。"""
+    def prefill_batch(self, x, positions, lengths, caches, layer_idx):
+        """计算补齐后的整批注意力 只缓存每个请求的有效prompt,不包含padding部分。"""
         B, T, _ = x.shape
         Q = self.RoPE(self.mutihead(self.Wq(x)), positions)
         K_new = self.RoPE(self.mutihead(self.Wk(x)), positions)
@@ -159,17 +146,14 @@ class CasualSelfAttention(nn.Module):
         output = (prob @ V_new).transpose(1, 2).reshape(B, T, self.config["d_model"])
         output = self.ffn(output)
 
-        caches = []
         for b, length in enumerate(lengths):
             # 只复制真实token的KV到该请求最终使用的缓存。
             k = K_new[b : b + 1, :, :length, :]
             v = V_new[b : b + 1, :, :length, :]
-            cache = LayerKVCache(k, v, capacities[b])
-            cache.append(k, v)
-            caches.append(cache)
-        return output, caches
+            caches[b].write(layer_idx, 0, k, v)
+        return output
 
-    def decode_batch(self, x, positions, caches):
+    def decode_batch(self, x, positions, caches, layer_idx):
         B, T, _ = x.shape
         if T != 1 or positions.shape != (B, 1) or len(caches) != B:
             raise ValueError("decode_batch 要求每个请求恰有一个 token/cache")
@@ -181,15 +165,14 @@ class CasualSelfAttention(nn.Module):
         Q = self.RoPE(Q, positions)
         K_new = self.RoPE(K_new, positions)
 
-        # 每个请求有自己的kvcache即LayerKVCache
+        # 每个请求持有一个 KVCache，本层写入同一个逻辑位置。
         for b, cache in enumerate(caches):
-            if (
-                cache.k.size(0) != 1
-            ):  # cache.k 的形状约定为 [1, head数, 缓存容量, head维度]
-                raise ValueError("每个 LayerKVCache 应只属于一个请求")
-            cache.append(K_new[b : b + 1], V_new[b : b + 1])
+            cache.write(
+                layer_idx, cache.length, K_new[b : b + 1], V_new[b : b + 1]
+            )
 
-        lengths = [cache.length for cache in caches]
+        # 公共 length 尚未提交，读取范围需包括本轮新写入的 token。
+        lengths = [cache.length + T for cache in caches]
         Lmax = max(lengths)
 
         H, D = Q.size(1), Q.size(-1)
@@ -201,8 +184,9 @@ class CasualSelfAttention(nn.Module):
 
         for b, cache in enumerate(caches):
             n = lengths[b]
-            K[b, :, :n] = cache.k[0, :, :n]  # 作用在前 3 维，第 4 维隐式:
-            V[b, :, :n] = cache.v[0, :, :n]
+            k, v = cache.get_layer(layer_idx, n)
+            K[b, :, :n] = k[0]
+            V[b, :, :n] = v[0]
 
         score = Q @ K.transpose(-2, -1) / math.sqrt(D)  # [B,H,1,Lmax]
         valid = (
@@ -230,16 +214,18 @@ class TransformerBlock(nn.Module):
         )
         self.drop = nn.Dropout(config["dropout"])
 
-    def prefill_batch(self, x, positions, lengths, capacities):
-        attn_output, caches = self.atte.prefill_batch(
-            self.layerNorm1(x), positions, lengths, capacities
+    def prefill_batch(self, x, positions, lengths, caches, layer_idx):
+        attn_output = self.atte.prefill_batch(
+            self.layerNorm1(x), positions, lengths, caches, layer_idx
         )
         x = x + self.drop(attn_output)
         x = x + self.drop(self.ffn(self.layerNorm2(x)))
-        return x, caches
+        return x
 
-    def decode_batch(self, x, positions, caches):
-        attn_output = self.atte.decode_batch(self.layerNorm1(x), positions, caches)
+    def decode_batch(self, x, positions, caches, layer_idx):
+        attn_output = self.atte.decode_batch(
+            self.layerNorm1(x), positions, caches, layer_idx
+        )
         x = x + self.drop(attn_output)
         x = x + self.drop(self.ffn(self.layerNorm2(x)))
         return x
@@ -283,7 +269,7 @@ class LiteGPT(nn.Module):
         max_new_tokens: 可选的逐请求生成上限；缺省时缓存容量为 max_seq_len。
         返回:
             last_logits: [B, vocab_size]
-            states: 每个请求一个独立的 RequestState
+            caches: 每个请求一个独立的 KVCache，包含所有层的 K/V
         """
         if self.training:
             raise ValueError("请先调用 model.eval()")
@@ -295,7 +281,7 @@ class LiteGPT(nn.Module):
             raise ValueError("pad_token_id 必须是有效的 token ID")
 
         device = self.token_embedding.weight.device
-        lengths = [len(ids) for ids in prompts]
+        lengths = [len(ids) for ids in prompts] # batch内不同请求的长度可能不同
         batch_size = len(prompts)
         max_len = max(lengths)
         max_seq_len = self.config["max_seq_len"]
@@ -303,17 +289,13 @@ class LiteGPT(nn.Module):
         if max_new_tokens is None:
             capacities = [max_seq_len] * batch_size
         else:
-            if isinstance(max_new_tokens, bool):
-                raise ValueError("max_new_tokens 应为非负整数或与请求等长的非负整数序列")
-            if isinstance(max_new_tokens, int):
+            if isinstance(max_new_tokens, int) and max_new_tokens>=0:
                 max_new_tokens = [max_new_tokens] * batch_size
-            if not isinstance(max_new_tokens, (list, tuple)):
-                raise ValueError("max_new_tokens 应为非负整数或与请求等长的非负整数序列")
-            if len(max_new_tokens) != batch_size or any(
-                isinstance(n, bool) or not isinstance(n, int) or n < 0
-                for n in max_new_tokens
-            ):
-                raise ValueError("max_new_tokens 应为非负整数或与请求等长的非负整数序列")
+            else:
+                raise ValueError(
+                    "max_new_tokens应为非负整数或与请求等长的非负整数序列"
+                )
+            
             capacities = [
                 min(max_seq_len, length + n)
                 for length, n in zip(lengths, max_new_tokens)
@@ -327,70 +309,70 @@ class LiteGPT(nn.Module):
         )
 
         for b, ids in enumerate(prompts):
-            input_ids[b, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
+            input_ids[b, : len(ids)] = torch.tensor(
+                ids, dtype=torch.long, device=device
+            )
 
         positions = torch.arange(max_len, device=device)
         x = self.drop(self.token_embedding(input_ids))
-        caches_by_request = [[] for _ in range(batch_size)]
-        for block in self.trans:
-            x, layer_caches = block.prefill_batch(x, positions, lengths, capacities)
-            for b, cache in enumerate(layer_caches):
-                caches_by_request[b].append(cache)
+        #创建KVCache缓存
+        caches = [KVCache(len(self.trans), capacity) for capacity in capacities]
+        for layer_idx, block in enumerate(self.trans):
+            x = block.prefill_batch(x, positions, lengths, caches, layer_idx)
 
         rows = torch.arange(batch_size, device=device)
         last_positions = torch.tensor(lengths, dtype=torch.long, device=device) - 1
         # 仅投影各请求最后一个有效位置，避免生成 [B,T,vocab_size] 的大 logits。
         last_logits = self.lm_head(self.layerNorm(x[rows, last_positions]))
-        states = [
-            RequestState(ids, tuple(caches_by_request[b]))
-            for b, ids in enumerate(prompts)
-        ]
+        # 所有层都写完后，每个请求只推进一次缓存长度。
+        for cache, length in zip(caches, lengths):
+            cache.advance(length)
 
-        return last_logits, states
+        return last_logits, caches
 
     @torch.no_grad()
-    def decode_batch(self, requests):
-        if not requests:
-            raise ValueError("请求列表不能为空")
+    def decode_batch(
+        self,
+        input_token_ids: list[int],
+        caches: list[KVCache],
+    ):
+        if not caches or len(input_token_ids) != len(caches):
+            raise ValueError("每个输入 token 必须对应一个 KVCache")
         if self.training:
             raise ValueError("批量 decode 请先调用 model.eval()")
-        for req in requests:
-            if len(req.past_key_values) != len(self.trans):
-                raise ValueError("请求的 KV cache 层数不匹配")
-            if req.cached_len >= self.config["max_seq_len"]:
-                raise ValueError("超过 max_seq_len")
-            if any(cache.length >= cache.k.size(-2) for cache in req.past_key_values):
-                raise ValueError("请求的 KV cache 容量不足，不能继续 decode")
+        if len({id(cache) for cache in caches}) != len(caches):
+            raise ValueError("同一批次不能重复使用一个请求的 KVCache")
+        for cache in caches:
+            if len(cache.keys) != len(self.trans):
+                raise ValueError("缓存层数与模型不一致")
 
-        # 同一个请求不能在 batch 中出现两次 id取对象的"身份标识" {}set
-        if len({id(req) for req in requests}) != len(requests):
-            raise ValueError("同一个请求不能重复加入 decode batch")
+            if cache.length >= self.config["max_seq_len"]:
+                raise ValueError("超过模型上下文上限")
 
-        # 不同请求也不能共用某一层的 KV 缓存
-        for layer_idx in range(len(self.trans)):
-            cache_ids = [id(req.past_key_values[layer_idx]) for req in requests]
-            if len(set(cache_ids)) != len(cache_ids):
-                raise ValueError(f"第 {layer_idx} 层的 KV cache 被多个请求共用")
+            if cache.length >= cache.capacity:
+                raise ValueError("KV cache 容量不足")
 
         device = self.token_embedding.weight.device
         positions = torch.tensor(
-            [req.cached_len for req in requests],
+            [cache.length for cache in caches],
             dtype=torch.long,
             device=device,
         )[:, None]
 
         input_ids = torch.tensor(
-            [req.pending_token for req in requests], dtype=torch.long, device=device
-        )[
-            :, None
-        ]  # [B,1]
+            input_token_ids,
+            dtype=torch.long,
+            device=device,
+        )[:, None]  # [B,1]由于每次只decode一个token
 
         x = self.drop(self.token_embedding(input_ids))
 
         for layer_idx, block in enumerate(self.trans):
-            layer_caches = [req.past_key_values[layer_idx] for req in requests]
-            x = block.decode_batch(x, positions, layer_caches)
-        return self.lm_head(self.layerNorm(x))  # [B,1,vocab_size]
+            x = block.decode_batch(x, positions, caches, layer_idx)
+        logits = self.lm_head(self.layerNorm(x))  # [B,1,vocab_size]
+        for cache in caches:
+            cache.advance(1)
+        return logits
 
 
 def get_config(vocab_size):

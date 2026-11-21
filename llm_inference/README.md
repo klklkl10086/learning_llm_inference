@@ -1,35 +1,28 @@
-# 推理系统主线
+# 类的设计
+| 对象 | 保存内容 | 谁修改 |
+|---|---|---|
+| `Request` | 完整 token 序列、生成限制、逻辑进度 | Scheduler |
+| `ScheduledRequest` | 请求 ID、本轮起始位置、本轮数量 | 创建后固定 |
+| `KVCache` | 一个请求所有层的 K/V、缓存容量和有效长度 | 模型前向 |
+| `ModelRunner` | 请求 ID 到缓存状态的映射 | ModelRunner |
 
-这个目录集中保存后续要接成系统的代码。现有 Python 文件只移动和重命名，内容保留原样。
+`KVCache.keys[layer_idx]` 和 `values[layer_idx]` 的形状均为
+`[1, n_heads, capacity, head_dim]`。各层通过 `write()` 写入同一个逻辑位置；
+完整模型前向结束后，统一调用 `advance()` 推进一次 `length`。
+缓存不保存 token 序列，decode 的 token 显式传入 `model.decode_batch(token_ids, caches)`。
 
-## 已有文件
+调度器与执行器可以这样接通：
 
-| 文件 | 来源 | 当前状态 |
-| --- | --- | --- |
-| [model.py](model.py) | `04_batched_decode/batch_prefill_decode_optimized.py` | 支持完整 prompt 的批量 prefill，以及每请求一个 token 的批量 decode |
-| [scheduler.py](scheduler.py) | `05_scheduler/scheduler.py` | 请求、计划和批次选择已有草稿；结果处理尚未接完 |
+```python
+while (plan := scheduler.schedule()) is not None:
+    requests = {
+        item.request_id: scheduler.get_request(item.request_id)
+        for item in plan.items
+    }
+    sampled_tokens = runner.execute(plan, requests)
+    finished_ids = scheduler.update(plan.batch_id, sampled_tokens)
+    runner.release(finished_ids)
+```
 
-模型提供 `LiteGPT`、`RequestState` 和 `LayerKVCache`。当前模型没有实现 `forward()` 或 `generate()`；执行入口是 `prefill_batch()` 和 `decode_batch()`，使用前调用 `model.eval()`。
-
-- `prefill_batch(prompts, pad_token_id=0, max_new_tokens=None)` 返回 `[B, vocab_size]` 的 logits 和逐请求状态。
-- `decode_batch(states)` 返回 `[B, 1, vocab_size]` 的 logits，并原地推进各层 KV cache 的长度。
-- 采样和 `append_token()` 由调用方负责。刚生成的 token 到下一次 decode 才会写入 KV。
-- prefill 当前只接受完整 prompt，不支持已有历史 KV 上的分块续算。
-- prefill 的 `max_new_tokens` 参数当前用于规划连续缓存容量；分配职责以后再移交缓存管理器。
-
-调度器的 `on_prefill_done()` 尚未完成；它引用的 `_require_plan()` 等方法还在[回调草稿](../05_scheduler/scheduler_callbacks_draft.py)中，没有接入 Scheduler 类。这个目录当前可以导入，但尚无可运行的 Engine。
-
-## 接下来增加什么
-
-以下文件尚未创建，按实际实现进度再增加：
-
-| 未来文件 | 职责 |
-| --- | --- |
-| `model_runner.py` | 包装现有模型入口，准备输入、执行和采样，维护请求与模型状态的对应关系 |
-| `engine.py` | 实现请求提交和 `step()`，串联调度、执行、状态更新与回收 |
-| `request.py` | 当跨模块共享类型出现时，集中定义请求、计划、执行结果，避免重复定义 |
-| `kv_cache.py` | 接入独立缓存管理后，承接缓存分配、扩容与回收 |
-
-当前用 Python 的 namespace package 方式导入，从项目根目录可使用 `from llm_inference.model import LiteGPT`，无需添加空的 Python 文件。外部脚本以后通过 Engine 使用系统。
-
-设计边界见[系统设计](../docs/ARCHITECTURE.md)，下一步任务见[学习路线](../docs/LEARNING_PLAN.md)。
+当前采用逐请求的连续缓存。后续分页时，可将 `KVCache` 内部改成请求的 block table，
+实际 K/V 张量由全局缓存池持有，一个请求关联多个物理 block。
